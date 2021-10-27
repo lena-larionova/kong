@@ -2,6 +2,7 @@ local constants     = require "kong.constants"
 local ipmatcher     = require "resty.ipmatcher"
 local lrucache      = require "resty.lrucache"
 local utils         = require "kong.tools.utils"
+local isempty       = require "table.isempty"
 local bit           = require "bit"
 
 
@@ -452,7 +453,7 @@ local function marshall_route(r)
         has_header_plain = true
 
         local header_values_map = {}
-        for i, header_value in ipairs(header_values) do
+        for _, header_value in ipairs(header_values) do
           header_values_map[lower(header_value)] = true
         end
 
@@ -748,7 +749,7 @@ local function sort_routes(r1, r2)
     end
   end
 
-  -- only regex path use regex_priority 
+  -- only regex path use regex_priority
   if band(r1.submatch_weight,MATCH_SUBRULES.HAS_REGEX_URI) ~= 0 then
     do
       local rp1 = r1.route.regex_priority or 0
@@ -1433,7 +1434,18 @@ function _M.new(routes)
     end
   end
 
-  local grab_req_headers = #plain_indexes.headers > 0
+  local match_headers         = not isempty(plain_indexes.headers)
+  local match_hosts           = not isempty(plain_indexes.hosts)
+  local match_wildcard_hosts  = not isempty(wildcard_hosts)
+  local match_regex_uris      = not isempty(regex_uris)
+  local match_uris            = not isempty(plain_indexes.uris)
+  local match_prefix_uris     = not isempty(prefix_uris)
+  local match_methods         = not isempty(plain_indexes.methods)
+  local match_sources         = not isempty(plain_indexes.sources)
+  local match_src_trust_funcs = not isempty(src_trust_funcs)
+  local match_destinations    = not isempty(plain_indexes.destinations)
+  local match_dst_trust_funcs = not isempty(dst_trust_funcs)
+  local match_snis            = not isempty(plain_indexes.snis)
 
   local function find_route(req_method, req_uri, req_host, req_scheme,
                             src_ip, src_port,
@@ -1492,8 +1504,6 @@ function _M.new(routes)
 
     local raw_req_host = req_host
 
-    req_method = upper(req_method)
-
     -- req_host might have port or maybe not, host_no_port definitely doesn't
     -- if there wasn't a port, req_port is assumed to be the default port
     -- according the protocol scheme
@@ -1515,23 +1525,24 @@ function _M.new(routes)
 
     -- header match
 
-    for _, header_name in ipairs(plain_indexes.headers) do
-      if req_headers[header_name] then
-        req_category = bor(req_category, MATCH_RULES.HEADER)
-        hits.header_name = header_name
-        break
+    if match_headers then
+      for _, header_name in ipairs(plain_indexes.headers) do
+        if req_headers[header_name] then
+          req_category = bor(req_category, MATCH_RULES.HEADER)
+          hits.header_name = header_name
+          break
+        end
       end
     end
 
     -- cache lookup (except for headers-matched Routes)
     -- if trigger headers match rule, ignore routes cache
-
-    local cache_key = req_method .. "|" .. req_uri .. "|" .. req_host ..
-                      "|" .. ctx.src_ip .. "|" .. ctx.src_port ..
-                      "|" .. ctx.dst_ip .. "|" .. ctx.dst_port ..
-                      "|" .. ctx.sni
-
-    do
+    local cache_key
+    if hits.header_name ~= nil then
+      cache_key = req_method .. "|" .. req_uri    .. "|" .. req_host ..
+                                "|" .. ctx.src_ip .. "|" .. ctx.src_port ..
+                                "|" .. ctx.dst_ip .. "|" .. ctx.dst_port ..
+                                "|" .. ctx.sni
       local match_t = cache:get(cache_key)
       if match_t and hits.header_name == nil then
         return match_t
@@ -1540,12 +1551,12 @@ function _M.new(routes)
 
     -- host match
 
-    if plain_indexes.hosts[host_with_port]
-      or plain_indexes.hosts[host_no_port]
+    if match_hosts and (plain_indexes.hosts[host_with_port] or
+      plain_indexes.hosts[host_no_port])
     then
       req_category = bor(req_category, MATCH_RULES.HOST)
 
-    elseif ctx.req_host then
+    elseif match_wildcard_hosts and ctx.req_host then
       for i = 1, #wildcard_hosts do
         local from, _, err = re_find(host_with_port, wildcard_hosts[i].regex,
                                      "ajo")
@@ -1564,26 +1575,28 @@ function _M.new(routes)
 
     -- uri match
 
-    for i = 1, #regex_uris do
-      local from, _, err = re_find(req_uri, regex_uris[i].regex, "ajo")
-      if err then
-        log(ERR, "could not evaluate URI regex: ", err)
-        return
-      end
+    if match_regex_uris then
+      for i = 1, #regex_uris do
+        local from, _, err = re_find(req_uri, regex_uris[i].regex, "ajo")
+        if err then
+          log(ERR, "could not evaluate URI regex: ", err)
+          return
+        end
 
-      if from then
-        hits.uri     = regex_uris[i].value
-        req_category = bor(req_category, MATCH_RULES.URI)
-        break
+        if from then
+          hits.uri     = regex_uris[i].value
+          req_category = bor(req_category, MATCH_RULES.URI)
+          break
+        end
       end
     end
 
-    if not hits.uri then
+    if match_uris and not hits.uri then
       if plain_indexes.uris[req_uri] then
         hits.uri     = req_uri
         req_category = bor(req_category, MATCH_RULES.URI)
 
-      else
+      elseif match_prefix_uris then
         for i = 1, #prefix_uris do
           if find(req_uri, prefix_uris[i].value, nil, true) == 1 then
             hits.uri     = prefix_uris[i].value
@@ -1596,47 +1609,51 @@ function _M.new(routes)
 
     -- method match
 
-    if plain_indexes.methods[req_method] then
+    if match_methods and plain_indexes.methods[req_method] then
       req_category = bor(req_category, MATCH_RULES.METHOD)
     end
 
     -- src match
 
-    if plain_indexes.sources[ctx.src_ip] then
-      req_category = bor(req_category, MATCH_RULES.SRC)
+    if match_sources then
+      if plain_indexes.sources[ctx.src_ip] then
+        req_category = bor(req_category, MATCH_RULES.SRC)
 
-    elseif plain_indexes.sources[ctx.src_port] then
-      req_category = bor(req_category, MATCH_RULES.SRC)
+      elseif plain_indexes.sources[ctx.src_port] then
+        req_category = bor(req_category, MATCH_RULES.SRC)
 
-    else
-      for i = 1, #src_trust_funcs do
-        if src_trust_funcs[i](ctx.src_ip) then
-          req_category = bor(req_category, MATCH_RULES.SRC)
-          break
+      elseif match_src_trust_funcs then
+        for i = 1, #src_trust_funcs do
+          if src_trust_funcs[i](ctx.src_ip) then
+            req_category = bor(req_category, MATCH_RULES.SRC)
+            break
+          end
         end
       end
     end
 
     -- dst match
 
-    if plain_indexes.destinations[ctx.dst_ip] then
-      req_category = bor(req_category, MATCH_RULES.DST)
+    if match_destinations then
+      if plain_indexes.destinations[ctx.dst_ip] then
+        req_category = bor(req_category, MATCH_RULES.DST)
 
-    elseif plain_indexes.destinations[ctx.dst_port] then
-      req_category = bor(req_category, MATCH_RULES.DST)
+      elseif plain_indexes.destinations[ctx.dst_port] then
+        req_category = bor(req_category, MATCH_RULES.DST)
 
-    else
-      for i = 1, #dst_trust_funcs do
-        if dst_trust_funcs[i](ctx.dst_ip) then
-          req_category = bor(req_category, MATCH_RULES.DST)
-          break
+      elseif match_dst_trust_funcs then
+        for i = 1, #dst_trust_funcs do
+          if dst_trust_funcs[i](ctx.dst_ip) then
+            req_category = bor(req_category, MATCH_RULES.DST)
+            break
+          end
         end
       end
     end
 
     -- sni match
 
-    if plain_indexes.snis[ctx.sni] then
+    if match_snis and plain_indexes.snis[ctx.sni] then
       req_category = bor(req_category, MATCH_RULES.SNI)
     end
 
@@ -1801,7 +1818,7 @@ function _M.new(routes)
               }
             }
 
-            if band(matched_route.match_rules, MATCH_RULES.HEADER) == 0 then
+            if cache_key and band(matched_route.match_rules, MATCH_RULES.HEADER) == 0 then
               cache:set(cache_key, match_t)
             end
 
@@ -1832,7 +1849,7 @@ function _M.new(routes)
       local headers
       local err
 
-      if grab_req_headers then
+      if match_headers then
         headers, err = get_headers(MAX_REQ_HEADERS)
         if err == "truncated" then
           log(WARN, "retrieved ", MAX_REQ_HEADERS, " headers for evaluation ",
