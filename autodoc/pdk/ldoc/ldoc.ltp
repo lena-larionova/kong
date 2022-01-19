@@ -48,6 +48,9 @@
 >     buf = buf .. comma .. tp
 >     comma = ", "
 >   end
+>   if string.match(tp, "|") then
+>     string.gsub(tp, "|", "\\|")
+>   end
 >   local def = item:default_of_param(p)
 >   if def == true then
 >     buf = buf .. comma .. "_optional_"
